@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Ledger Inbox</title>
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#141414">
+<style>
+:root{--bg:#141414;--card:#1e1e1e;--ink:#e8e8e8;--dim:#8a8a8a;--line:#333;--ok:#6fbf73;--warn:#d4812b}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--ink);font:16px/1.4 -apple-system,system-ui,sans-serif}
+h1{font-size:17px;margin:0 0 12px;font-weight:600}
+.cap{display:flex;gap:8px}
+textarea{flex:1;min-height:76px;padding:10px;font:inherit;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
+button{font:inherit;padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink);font-weight:600}
+.row{display:flex;align-items:flex-start;gap:8px;padding:10px 0;border-bottom:1px solid var(--line)}
+.row .txt{flex:1}
+.st{font-size:12px;color:var(--dim);flex:0 0 auto}
+.st.ok{color:var(--ok)}
+.bar{display:flex;justify-content:space-between;align-items:center;margin:14px 0 4px;color:var(--dim);font-size:13px}
+.x{background:none;border:none;color:var(--dim);padding:4px 8px}
+.note{color:var(--dim);font-size:13px;margin-top:14px}
+.setup{margin-top:20px;padding-top:12px;border-top:1px solid var(--line)}
+input[type=text]{width:100%;padding:8px;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px}
+@media(prefers-color-scheme:light){:root{--bg:#faf9f7;--card:#fff;--ink:#1a1a1a;--dim:#666;--line:#ddd}}
+</style>
+</head>
+<body>
+<h1>Inbox</h1>
+<div class="cap">
+  <textarea id="box" placeholder="Say or type a thought…" autocapitalize="sentences"></textarea>
+</div>
+<div class="bar"><button class="primary" id="add">Capture</button><span id="status"></span></div>
+<div id="list"></div>
+<div class="bar"><button id="sync">Sync now</button><button id="copy">Copy all</button></div>
+<div class="note" id="hint"></div>
+<div class="setup">
+  <div class="bar">Setup — stored on this device only</div>
+  <input type="text" id="url" placeholder="Apps Script /exec URL">
+  <div style="height:6px"></div>
+  <input type="text" id="tok" placeholder="Inbox token">
+  <div style="height:6px"></div>
+  <button id="save">Save</button>
+</div>
+<script>
+/* Life Ledger capture page.
+ *
+ * Knows FOUR things: a text box, a local queue, one URL and one token. It knows
+ * nothing about categories, priorities or the ledger, and that ignorance is the
+ * reliability argument — nothing in the ledger can change in a way that breaks
+ * this page, because it has never heard of it.
+ *
+ * A note is written to storage BEFORE any network call, so a hard kill right
+ * after typing cannot lose it. Synced notes go grey rather than disappearing,
+ * so a response that never arrived can't eat a thought either.
+ */
+var QKEY='ll.inbox.queue.v1', CKEY='ll.inbox.conf.v1', KEEP_DAYS=7;
+
+function readJSON(k,dflt){try{var s=localStorage.getItem(k);return s?JSON.parse(s):dflt;}catch(e){return dflt;}}
+function writeJSON(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true;}catch(e){return false;}}
+function loadQueue(){var q=readJSON(QKEY,[]);return Array.isArray(q)?q:[];}
+function saveQueue(q){return writeJSON(QKEY,q);}
+function loadConf(){var c=readJSON(CKEY,{});return (c&&typeof c==='object')?c:{};}
+function saveConf(c){return writeJSON(CKEY,c);}
+
+function newId(){return 'inb_'+Date.now()+'_'+Math.floor(Math.random()*100000);}
+
+// Capture: persist FIRST, then try to send. Returns the stored item.
+function addNote(text){
+  var raw=String(text||'').trim();
+  if(!raw)return null;
+  var q=loadQueue();
+  var item={id:newId(),raw:raw,capturedAt:Date.now(),synced:false};
+  q.push(item);
+  saveQueue(q);
+  return item;
+}
+
+function removeNote(id){
+  var q=loadQueue(), item=q.filter(function(i){return i.id===id;})[0];
+  if(!item)return null;
+  saveQueue(q.filter(function(i){return i.id!==id;}));
+  return item;
+}
+
+// Prune only SYNCED notes, and only old ones. A queued note is never dropped by
+// age — it is the only copy in existence.
+function pruneLocal(now){
+  var cut=(now||Date.now())-KEEP_DAYS*86400000;
+  var q=loadQueue();
+  var left=q.filter(function(i){return !i.synced||(i.capturedAt||0)>=cut;});
+  if(left.length!==q.length)saveQueue(left);
+  return q.length-left.length;
+}
+
+// A plain GET with everything in the query string. This is a CONSTRAINT, not a
+// preference: Apps Script does not answer a CORS preflight, so a custom header
+// or a JSON content-type would fail cross-origin. A GET avoids preflight.
+function syncUrl(conf,item){
+  return conf.url
+    +(conf.url.indexOf('?')<0?'?':'&')
+    +'action=submitInbox'
+    +'&token='+encodeURIComponent(conf.tok)
+    +'&id='+encodeURIComponent(item.id)
+    +'&raw='+encodeURIComponent(item.raw)
+    +'&capturedAt='+encodeURIComponent(item.capturedAt)
+    +'&source=pwa';
+}
+
+// Send every unsynced note. Resolves with {sent, failed, error}. A failure leaves
+// the item queued; because the id is ours, a later retry is a server-side no-op
+// rather than a duplicate.
+//
+// A note is marked synced ONLY when the server's JSON body says ok:true. The
+// HTTP status is not enough: doGet answers a bad token (or any thrown error)
+// with HTTP 200 and {ok:false}, so trusting the status would put a tick on a
+// note that never landed — and a ticked note is eventually pruned, which would
+// make that the one silent way this page could lose a thought.
+function syncAll(fetchImpl){
+  var f=fetchImpl||(typeof fetch==='function'?fetch:null);
+  var conf=loadConf();
+  if(!conf.url||!conf.tok)return Promise.resolve({sent:0,failed:0,unconfigured:true});
+  if(!f)return Promise.resolve({sent:0,failed:0});
+  var q=loadQueue(), todo=q.filter(function(i){return !i.synced;});
+  if(!todo.length)return Promise.resolve({sent:0,failed:0});
+  var sent=0,failed=0,lastErr=null;
+  return todo.reduce(function(chain,item){
+    return chain.then(function(){
+      return f(syncUrl(conf,item)).then(function(r){
+        if(!r||!r.ok||typeof r.json!=='function')throw new Error('server unreachable');
+        return r.json();
+      }).then(function(body){
+        if(!body||body.ok!==true)throw new Error((body&&body.error)||'server rejected the note');
+        // Re-read: the queue may have grown while this request was in flight.
+        var cur=loadQueue();
+        cur.forEach(function(x){if(x.id===item.id)x.synced=true;});
+        saveQueue(cur);
+        sent++;
+      }).catch(function(e){failed++;lastErr=(e&&e.message)||'sync failed';});
+    });
+  },Promise.resolve()).then(function(){return {sent:sent,failed:failed,error:lastErr};});
+}
+
+/* ---------- UI ---------- */
+function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':s);return d.innerHTML;}
+function render(){
+  var q=loadQueue().slice().sort(function(a,b){return b.capturedAt-a.capturedAt;});
+  var conf=loadConf();
+  document.getElementById('list').innerHTML=q.length?q.map(function(i){
+    return '<div class="row"><span class="st'+(i.synced?' ok':'')+'">'+(i.synced?'✓':'↑')+'</span>'
+      +'<span class="txt">'+esc(i.raw)+'</span>'
+      +'<button class="x" data-del="'+i.id+'">×</button></div>';
+  }).join(''):'<div class="note">Nothing captured.</div>';
+  var queued=q.filter(function(i){return !i.synced;}).length;
+  document.getElementById('status').textContent=queued?(queued+' waiting to send'):(q.length?'all sent':'');
+  document.getElementById('hint').textContent=(!conf.url||!conf.tok)
+    ?'Add your URL and token below before notes can sync.'
+    :'Notes sync automatically whenever you have signal.';
+  document.getElementById('url').value=conf.url||'';
+  document.getElementById('tok').value=conf.tok||'';
+}
+// Say WHY a send failed, so a mistyped token shows up as one rather than as a
+// queue that mysteriously never drains.
+function trySync(){syncAll().then(function(r){
+  render();
+  if(r&&r.failed&&r.error)document.getElementById('status').textContent=r.failed+' not sent: '+r.error;
+});}
+
+if(typeof document!=='undefined'&&document.getElementById('add')){
+  document.getElementById('add').onclick=function(){
+    var box=document.getElementById('box');
+    if(addNote(box.value)){box.value='';render();trySync();}
+  };
+  document.getElementById('sync').onclick=trySync;
+  document.getElementById('copy').onclick=function(){
+    var txt=loadQueue().map(function(i){return i.raw;}).join('\n');
+    if(navigator.clipboard)navigator.clipboard.writeText(txt);
+    document.getElementById('status').textContent='Copied '+loadQueue().length+' note(s).';
+  };
+  document.getElementById('list').onclick=function(e){
+    var id=e.target&&e.target.getAttribute&&e.target.getAttribute('data-del');
+    if(!id)return;
+    var item=loadQueue().filter(function(i){return i.id===id;})[0];
+    if(!item)return;
+    // A local delete is LOCAL. A synced note already exists in the ledger's
+    // inbox and is dismissed there; a queued note has no other copy anywhere,
+    // so removing it here destroys it. Say which one is happening.
+    var msg=item.synced
+      ?'Remove from this phone? It has already been sent, so it stays in your Ledger inbox.'
+      :'Delete for good? This note has not been sent yet, so this is the only copy.';
+    if(confirm(msg)){removeNote(id);render();}
+  };
+  document.getElementById('save').onclick=function(){
+    saveConf({url:(document.getElementById('url').value||'').trim(),tok:(document.getElementById('tok').value||'').trim()});
+    render();trySync();
+  };
+  pruneLocal();
+  render();
+  trySync();
+  window.addEventListener('online',trySync);
+  if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js');
+}
+</script>
+</body>
+</html>
