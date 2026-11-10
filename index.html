@@ -38,7 +38,7 @@ input[type=text]{width:100%;padding:8px;background:var(--card);color:var(--ink);
 <div class="note" id="hint"></div>
 <div class="setup">
   <div class="bar">Setup — stored on this device only</div>
-  <input type="text" id="url" placeholder="Apps Script /exec URL">
+  <input type="text" id="url" placeholder="Paste your setup link (or the /exec URL)">
   <div style="height:6px"></div>
   <input type="text" id="tok" placeholder="Inbox token">
   <div style="height:6px"></div>
@@ -64,6 +64,27 @@ function loadQueue(){var q=readJSON(QKEY,[]);return Array.isArray(q)?q:[];}
 function saveQueue(q){return writeJSON(QKEY,q);}
 function loadConf(){var c=readJSON(CKEY,{});return (c&&typeof c==='object')?c:{};}
 function saveConf(c){return writeJSON(CKEY,c);}
+
+// A setup link (made by inboxSetup() in the Apps Script editor) carries the URL
+// and token in its fragment: ...ledger-inbox/#url=<enc>&tok=<enc>. Opening it
+// configures this page; so does pasting it into the first setup box, which is
+// the path that works on an iPhone, where a home-screen app doesn't share
+// Safari's storage. Returns {url, tok} or null — never a half-configuration.
+function parseSetup(s){
+  var str=String(s==null?'':s), h=str.indexOf('#');
+  if(h<0)return null;
+  var out={};
+  try{
+    str.slice(h+1).split('&').forEach(function(kv){
+      var i=kv.indexOf('=');if(i<1)return;
+      out[kv.slice(0,i)]=decodeURIComponent(kv.slice(i+1));
+    });
+  }catch(e){return null;}
+  var url=String(out.url||'').trim(), tok=String(out.tok||'').trim();
+  if(!/^https:\/\//i.test(url)||!tok)return null;
+  return {url:url,tok:tok};
+}
+function applySetup(s){var c=parseSetup(s);if(!c)return false;return saveConf(c);}
 
 function newId(){return 'inb_'+Date.now()+'_'+Math.floor(Math.random()*100000);}
 
@@ -156,7 +177,7 @@ function render(){
   var queued=q.filter(function(i){return !i.synced;}).length;
   document.getElementById('status').textContent=queued?(queued+' waiting to send'):(q.length?'all sent':'');
   document.getElementById('hint').textContent=(!conf.url||!conf.tok)
-    ?'Add your URL and token below before notes can sync.'
+    ?'Paste your setup link into the first box below and tap Save.'
     :'Notes sync automatically whenever you have signal.';
   document.getElementById('url').value=conf.url||'';
   document.getElementById('tok').value=conf.tok||'';
@@ -193,11 +214,21 @@ if(typeof document!=='undefined'&&document.getElementById('add')){
     if(confirm(msg)){removeNote(id);render();}
   };
   document.getElementById('save').onclick=function(){
-    saveConf({url:(document.getElementById('url').value||'').trim(),tok:(document.getElementById('tok').value||'').trim()});
+    var setup=parseSetup(document.getElementById('url').value);
+    saveConf(setup||{url:(document.getElementById('url').value||'').trim(),tok:(document.getElementById('tok').value||'').trim()});
     render();trySync();
+    if(setup)document.getElementById('status').textContent='This phone is set up.';
   };
   pruneLocal();
+  // Opened from a setup link: save it, then take the token out of the address
+  // bar so it isn't left on screen or in a bookmark.
+  var setUpNow=false;
+  if(location.hash&&applySetup(location.hash)){
+    setUpNow=true;
+    try{history.replaceState(null,'',location.pathname+location.search);}catch(e){}
+  }
   render();
+  if(setUpNow)document.getElementById('status').textContent='This phone is set up.';
   trySync();
   window.addEventListener('online',trySync);
   if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js');

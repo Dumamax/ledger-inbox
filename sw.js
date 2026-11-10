@@ -6,7 +6,7 @@
  * is reopened. This single constant is the only thing standing between a fix
  * and a phone that never sees it.
  */
-var CACHE_VERSION = 'll-inbox-v2';
+var CACHE_VERSION = 'll-inbox-v3';
 var ASSETS = ['./', './index.html', './manifest.json', './icon.svg'];
 
 self.addEventListener('install', function (e) {
